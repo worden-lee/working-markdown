@@ -9,6 +9,8 @@ $ww_sources = array(
 	'WWStorage.php',
 	'ProjectDescription.php',
 	'WorkingWikiProjectDescription.php',
+	'ProjectEngineConnection.php',
+	'ProjectEngine/ProjectEngine.php',
 	// TODO fill out this list thoughtfully
 );
 
@@ -18,9 +20,49 @@ foreach ( $ww_sources as $php ) {
 
 $wwClickToAdd = false;
 $wwLogFunction = function ( $string ) { print $string . "\n"; };
+$wwUseHTTPForPE = false;
+$wwPECanReadFilesFromWiki = $wwPEFilesAreAccessible = true;
+
+$peAllowProcessingInPlace = true;
 
 class WMDInterface extends WWInterface {
+	public function reconcile_token_with_project( $token, $token_start, $token_length, $pagename ) {
+		global $wwContext;
+		$this->uniq_tokens[$token]['project'] =
+			$wwContext->wwStorage->find_project_by_name(
+				$this->uniq_tokens[$token]['args']['project']
+			);
+		$this->uniq_tokens[$token]['file_content'] = null;
+	}
 
+	public function page_is_history() {
+		return false;
+	}
+
+	public function sse_key_if_any() {
+		return null;
+	}
+
+	public function amend_PE_request( &$request ) {
+		parent::amend_PE_request( $request );
+		$request['log-to-stdout'] = true;
+	}
+
+	/* TODO: syntax highlighting */
+	public function hasSyntaxHighlighter() {
+		return false;
+	}
+
+	/* TODO: pulldown links or something? */
+	public function altlinks_text( &$project, $display_filename, $args, $alts ) {
+		return '';
+	}
+};
+
+class WMDStorage extends WWStorage {
+	public function ok_to_archive_files( $request ) {
+		return false;
+	}
 };
 
 class WMDLocalProjectDescription extends WorkingWikiProjectDescription {
@@ -28,19 +70,37 @@ class WMDLocalProjectDescription extends WorkingWikiProjectDescription {
 		$this->project_description_page = null;
 		$this->project_files = array();
 		$this->projectname = $directory;
-		$this->uri = null;
+		$this->uri = preg_replace( '{/$}', '', "file://$directory" );
 		$this->options['use-default-makefiles'] = true; // ??
 		$this->as_of_revision = null;
+		/*
 		foreach ( wwfFindFiles( $directory ) as $filename ) {
 			$this->add_source_file( array(
 				'filename' => $filename,
 			) );
 		}
+		*/
 		//$this->add_GNUmakefile(); // ??
 		if ( ! is_array( ProjectDescription::$project_cache ) ) {
 			ProjectDescription::$project_cache = array();
 		}
 		ProjectDescription::$project_cache[ $directory ] = $this;
+	}
+
+	/* this class of project doesn't sync its source files into
+	 * PE, because they're going to be used where they already are.
+	 */
+	public function all_source_file_contents() {
+		return array();
+	}
+
+	public function fill_pe_request( &$request, $focal, $sync_sf ) {
+		parent::fill_pe_request( $request, $focal, $sync_sf );
+		$request['projects'][ $this->uri ]['process-in-place'] = true;
+	}
+
+	public function short_directory_name() {
+		return $this->projectname;
 	}
 };
 
@@ -64,8 +124,14 @@ if ( ! $infilename or ! $outfilename ) {
 	exit -1;
 }
 
-$project = new WMDLocalProjectDescription( '.' );
-WWInterface::$default_project_name = $project->project_name();
+$wwContext = new stdClass();
+$wwContext->wwInterface = new WMDInterface;
+$wwContext->wwStorage = new WMDStorage;
+
+# note this needs to be an absolute path, not '.'
+$project = new WMDLocalProjectDescription( realpath( '.' ) );
+
+$wwContext->wwInterface->default_project_name = $project->project_name();
 
 $tmpfilename = "$infilename.wmd-tmp";
 
@@ -80,7 +146,7 @@ if ( $phase == '--pre' ) {
 
 	# find locations of all the tags in the text
 
-	$tag_positions = WWStorage::find_project_files_on_page( $infilename, $intext ); 
+	$tag_positions = $wwContext->wwStorage->find_project_files_on_page( $infilename, $intext ); 
 
 	print json_encode( $tag_positions ) . "\n";
 
@@ -90,7 +156,7 @@ if ( $phase == '--pre' ) {
 	unset( $tag_positions['cache-filled'] );
 	foreach ( $tag_positions as $projectname => $projecttags ) {
 		if ( $projectname == '' ) {
-			$projectname = WWInterface::$default_project_name;
+			$projectname = $wwContext->wwInterface->default_project_name;
 		}
 		foreach ( $projecttags as $filedata ) {
 			print json_encode( $filedata ) . "\n";
@@ -101,13 +167,13 @@ if ( $phase == '--pre' ) {
 				// TODO: support various args
 			);
 			if ( $filedata['source'] ) {
-				$outtext .= WWInterface::source_file_hook(
+				$outtext .= $wwContext->wwInterface->source_file_hook(
 					'',
 					$tagargs,
 					null
 				);
 			} else {
-				$outtext .= WWInterface::project_file_hook(
+				$outtext .= $wwContext->wwInterface->project_file_hook(
 					'',
 					$tagargs,
 					null
@@ -121,7 +187,7 @@ if ( $phase == '--pre' ) {
 	file_put_contents( $tmpfilename, $outtext );
 
 	# record the location data
-	file_put_contents( "$tmpfilename.token_data", json_encode( WWInterface::$uniq_tokens ) . "\n" );
+	file_put_contents( "$tmpfilename.token_data", json_encode( $wwContext->wwInterface->uniq_tokens ) . "\n" );
 
 } else {
 
@@ -131,10 +197,11 @@ if ( $phase == '--pre' ) {
 	$intext = file_get_contents( $tmpfilename );
 
 	# read in token data
-	WWInterface::$uniq_tokens = json_decode( file_get_contents( "$tmpfilename.token_data" ), true );
+	$wwContext->wwInterface->uniq_tokens = json_decode( file_get_contents( "$tmpfilename.token_data" ), true );
 
 	$outtext = $intext;
-	WWInterface::expand_tokens( $outtext, null, $infilename );
+	$wwContext->wwInterface->set_page_being_parsed( $infilename ); // for MW_PAGENAME env var
+	$wwContext->wwInterface->expand_tokens( $outtext, null, $infilename );
 
 	# write text to output file
 	file_put_contents( $outfilename, $outtext );

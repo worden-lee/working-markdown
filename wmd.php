@@ -22,13 +22,13 @@ $wwClickToAdd = false;
 $wwLogFunction = function ( $string ) { print $string . "\n"; };
 $wwUseHTTPForPE = false;
 $wwPECanReadFilesFromWiki = $wwPEFilesAreAccessible = true;
-$math_repl = "'$1<source-file filename=\"'.md5('$2').'.tex-math\" project=\"'.\$GLOBALS['default_project_directory'].'/.workingwiki/standalone/'.md5('$2').'\">$2</source-file>'";
+$math_repl = "'$1<source-file filename=\"'.md5('$2').'.tex-math\" standalone=\"yes\">$2</source-file>'";
 $wwWikitextReplacements = array(
 	'/([^\\\\]|^)\{\$(.*?[^\\\\]|)\$\}/es' => $math_repl,
         '/([^\\\\]|^)\$\$(.*?[^\\\\]|)\$\$/e' => $math_repl,
         '/([^\\\\]|^)<latex>(.*?[^\\\\]|)<\/latex>/esi' =>
                 "'$1<source-file filename=\"'.md5('$2')"
-                . ".'.tex-inline\" project=\"'.\$GLOBALS['default_project_directory'].'/.workingwiki/standalone/'.md5('$2').'\">"
+                . ".'.tex-inline\" standalone=\"yes\">"
                 . "\\documentclass{article}\n"
                 . "\\begin{document}\n"
                 . "$2\n\\end{document}\n</source-file>'",
@@ -49,7 +49,7 @@ class WMDInterface extends WWInterface {
 			);
 		$this->uniq_tokens[$token]['project'] = $project;
 		#wwLog( 'for project: ' . $this->uniq_tokens[$token]['project']->project_name() );
-		//$this->uniq_tokens[$token]['file_content'] = null;
+		$this->uniq_tokens[$token]['file_content'] = null;
 		$args = $this->uniq_tokens[$token]['args'];
 		$source = ( $this->uniq_tokens[$token]['tag'] == 'source-file' );
 		if ( ! isset( $args['filename'] ) or $args['filename'] == '' ) {
@@ -93,41 +93,32 @@ class WMDInterface extends WWInterface {
 	}
 
 	/* TODO: pulldown links or something? */
-	public function altlinks_text( &$project, $display_filename, $args, $alts ) {
-		return '';
+	public function add_altlinks_to_project_file_html( $html, $project, $filename, $display_mode, $args, $alts ) {
+		return $html;
 	}
 
 	/* TODO: conditional mathjax */
-	public function include_latexml_resources( $thing ) {
-	}
 
 	public function get_project_file_base_url( $project, $filename, $make=true, $display=null ) {
 		if ( is_object($project) ) {
 			$project_path = $project->project_name();
-			$project = $project->short_directory_name();
+			$project = $project->short_dir_for_uri( $project->project_uri(), '' );
 		} else {
 			$project_path = $project;
 		}
 		# make sure the files will actually be there.
-		global $images_directory;
-		$project_images_dir = "$images_directory/$project";
-		if ( 0 ) {
-		if ( ! file_exists($project_images_dir) and
-			# hack: don't link standalone directories bc
-			# it's bad to do it before the main project
-			strpos( $project, 'standalone' ) === false ) {
-			@unlink($project_images_dir);
-			#wwLog( "mkdir " . dirname($project_images_dir) );
-			mkdir( dirname($project_images_dir), 0777, true );
-			#wwLog( "ln -s $project_path $project_images_dir" );
-			#symlink( $project_path, $project_images_dir );
-			system( "cp -r '$project_path' '$project_images_dir'" );
+		if ( file_exists( "$project_path/$filename" ) and
+			! is_dir( "$project_path/$filename" ) ) {
+			global $images_directory;
+			$project_images_dir = "$images_directory/$project";
+			if ( ! file_exists( $project_images_dir ) ) {
+				mkdir( $project_images_dir, 0777, true );
+			}
+			# there is a problem where this happens before the file
+			# gets made
+			wwLog( "copy $project_path/$filename $project_images_dir/$filename" );
+			copy( "$project_path/$filename", "$project_images_dir/$filename" );
 		}
-		}
-		if ( ! file_exists( $project_images_dir ) ) {
-			mkdir( $project_images_dir, 0777, true );
-		}
-		copy( "$project_path/$filename", "$project_images_dir/$filename" );
 		return "{{ site.baseurl }}/images/$project/$filename";
 	}
 };
@@ -148,9 +139,9 @@ class WMDStorage extends WWStorage {
 		if ( ! $create ) {
 			return null;
 		}
-		$standalone_key = 'Standalone ';
-		if ( substr( $name, 0, strlen($standalone_key) ) == $standalone_key ) {
-			return new WMDInPlaceStandaloneProjectDescription( substr( $name, strlen( $standalone_key ) ) );
+		if ( $this->is_standalone_name( $name ) ) {
+			$parts = explode( '?', $name );
+			return new WMDInPlaceStandaloneProjectDescription( $parts[1] );
 		}
 		return new WMDInPlaceProjectDescription( $name );
 	}
@@ -211,8 +202,8 @@ class WMDInPlaceProjectDescription extends WorkingWikiProjectDescription {
 		$request['projects'][ $this->uri ]['process-in-place'] = true;
 	}
 
-	public function short_directory_name() {
-		return preg_replace( '{^.*_posts_wmd/}', '', $this->projectname );
+	public function short_dir_for_uri( $uri, $varname ) {
+		return preg_replace( '{^.*_posts_wmd/}', '', $uri );
 	}
 
 	public function env_for_make_jobs() {
@@ -225,10 +216,15 @@ class WMDInPlaceStandaloneProjectDescription extends WMDInPlaceProjectDescriptio
 	public function __construct( $name ) {
 		global $default_project_directory;
 		parent::__construct( "$default_project_directory/.workingwiki/standalone/$name" );
+		#wwLog( "create_standalone_project $name: {$this->project_name()}" );
 	}
 
 	public function is_standalone() {
 		return true;
+	}
+
+	public function short_dir_for_uri( $uri, $varname ) {
+		return preg_replace( '{^.*standalone/}', '', $uri );
 	}
 };
 
@@ -307,40 +303,54 @@ if ( isset( $options['pre'] ) ) {
 
 	$tag_positions = $wwContext->wwStorage->find_project_files_on_page( $infilename, $intext ); 
 
-	# those tags are sorted by project, need them sorted in page order
+	print json_encode( $tag_positions ) . "\n";
+
+	# those tags are sorted by project, need them sorted from top to bottom of page
 
 	# flatten
-	$tags = $tag_positions;
-	unset( $tags['cache-filled'] );
-	$tags = call_user_func_array( 'array_merge', $tags );
+	$positions = array();
+	foreach ( $tag_positions as $pname => $proj_positions ) {
+		if ( ! is_array( $proj_positions ) ) {
+			# 'cache-filled' => true
+			continue;
+		}
+		foreach ( $proj_positions as $fname => $fdata ) {
+			if ( isset( $fdata['position'] ) ) {
+				foreach ( $fdata['position'] as $pair ) {
+					$positions[] = array( $pair[0], $pair[1], $pname, $fname );
+				}
+			}
+		}
+	}
 	# sort by page order
-	usort( $tags, function ( $a, $b ) {
-		return $a['position'][0] - $b['position'][0];
+	usort( $positions, function ( $a, $b ) {
+		return $a[0] - $b[0];
 	} );
 
-	print json_encode( $tags ) . "\n";
+	print json_encode( $positions ) . "\n";
 
-	# replace each tag by a token and output (where?)
+	# replace each tag by a token and assemble preprocessed text
 	$pretext = '';
 	$nextpos = 0;
-	foreach ( $tags as $tagdata ) {
-		if ( isset( $tagdata['attributes']['project'] ) ) {
-			$projectname = $tagdata['attributes']['project'];
-		} else {
-			$projectname = $wwContext->wwInterface->default_project_name;
-		}
+	foreach ( $positions as $position ) {
+		list( $tagstart, $tagend, $pname, $fname ) = $position;
+		$tagdata = $tag_positions[$pname][$fname];
+		#if ( isset( $tagdata['attributes']['project'] ) ) {
+		#	$projectname = $tagdata['attributes']['project'];
+		#} else {
+		#	$projectname = $wwContext->wwInterface->default_project_name;
+		#}
 		#print json_encode( $tagdata ) . "\n";
-		$keeptext = substr( $intext, $nextpos, $tagdata['position'][0] - $nextpos );
+		$keeptext = substr( $intext, $nextpos, $tagstart - $nextpos );
 		wwLog( "keep text: " . $keeptext );
 		$pretext .= $keeptext;
-		$tagargs = array(
-			'filename' => $tagdata['attributes']['filename'],
-			'project' => $projectname,
-			// TODO: support various args
-		);
+		$tagargs = $tagdata['attributes'];
+		#if ( ! isset( $tagargs['project'] ) ) {
+		#	$tagargs['project'] = $projectname;
+		#}
 		if ( $tagdata['source'] ) {
 			$token = $wwContext->wwInterface->source_file_hook(
-				'',
+				isset( $tagdata['content'] ) ? $tagdata['content'] : '',
 				$tagargs,
 				null
 			);
@@ -355,7 +365,7 @@ if ( isset( $options['pre'] ) ) {
 			wwLog( "token: $token" );
 			$pretext .= $token;
 		}
-		$nextpos = $tagdata['position'][1] + 1;
+		$nextpos = $tagend + 1;
 	}
 	$pretext .= substr( $intext, $nextpos );
 
@@ -386,12 +396,13 @@ if ( isset( $options['post'] ) ) {
 		$now = new DateTime( 'now' );
 		$wwContext->wwStorage->pagetext_cache[$infilename] = array(
 			'touched' => $now->format( 'YmdHis' ),
-			'text' => '', #$wmd_data['expanded_text'],
+			'text' => '',
 			'project-files' => $wmd_data['file_contents'],
 		);
 		$wwContext->wwInterface->currently_parsing_key = $infilename;
 	}
 
+	wwLog( "About to start expand_tokens(), uniq_tokens is " . json_encode( $wwContext->wwInterface->uniq_tokens ) );
 	$posttext = $pretext;
 	$wwContext->wwInterface->set_page_being_parsed( $infilename ); // for MW_PAGENAME env var
 	$wwContext->wwInterface->expand_tokens( $posttext, null, $infilename );
